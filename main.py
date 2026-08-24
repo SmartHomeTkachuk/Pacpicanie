@@ -3,7 +3,7 @@
 
 """
 Telegram-бот расписания Политеха.
-Версия 5.19 – окончательная, исправлен запуск.
+Версия 5.24 – полная, с прокси.
 """
 
 import asyncio
@@ -20,6 +20,7 @@ from typing import List, Dict, Optional, Tuple, Set, Any
 from zoneinfo import ZoneInfo
 
 import aiohttp
+import aiohttp_socks
 import aiosqlite
 import aiofiles
 import xml.etree.ElementTree as ET
@@ -68,6 +69,7 @@ class Settings:
         self.cleanup_locks_hour: int = int(os.getenv("CLEANUP_LOCKS_HOUR", "1"))
         self.cleanup_locks_minute: int = int(os.getenv("CLEANUP_LOCKS_MINUTE", "0"))
         self.admin_ids: List[int] = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
+        self.proxy_file: str = os.getenv("PROXY_FILE", "proxies.txt")
 
 settings = Settings()
 TZ = ZoneInfo(settings.timezone)
@@ -83,6 +85,90 @@ logging.basicConfig(
     handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
+
+# ============================================================================
+#  МЕНЕДЖЕР ПРОКСИ
+# ============================================================================
+
+class ProxyManager:
+    def __init__(self, proxy_file: str = "proxies.txt"):
+        self.proxy_file = proxy_file
+        self.proxies: List[str] = []
+        self.current_index = 0
+        self._lock = asyncio.Lock()
+
+    async def load_proxies(self) -> None:
+        async with self._lock:
+            try:
+                with open(self.proxy_file, "r") as f:
+                    proxies = [line.strip() for line in f if line.strip()]
+                if proxies:
+                    self.proxies = proxies
+                    logger.info(f"Загружено {len(self.proxies)} прокси из файла")
+                    return
+            except FileNotFoundError:
+                logger.warning(f"Файл {self.proxy_file} не найден, загружаем публичные прокси")
+
+            public = await self._fetch_public_proxies()
+            if public:
+                self.proxies = public
+                with open(self.proxy_file, "w") as f:
+                    f.write("\n".join(public))
+                logger.info(f"Загружено {len(self.proxies)} публичных прокси")
+            else:
+                self.proxies = ["socks5://free.glushilok.net:1080", "socks5://mtpro.xyz:1080"]
+                logger.warning("Используем запасной список прокси")
+
+    async def _fetch_public_proxies(self) -> List[str]:
+        urls = [
+            "https://raw.githubusercontent.com/LoneKingCode/free-proxy-db/main/socks5.txt",
+            "https://raw.githubusercontent.com/hookzof/socks5_list/main/socks5.txt",
+        ]
+        async with aiohttp.ClientSession() as session:
+            for url in urls:
+                try:
+                    async with session.get(url, timeout=10) as resp:
+                        if resp.status == 200:
+                            text = await resp.text()
+                            proxies = []
+                            for line in text.splitlines():
+                                line = line.strip()
+                                if line and not line.startswith("#"):
+                                    if "://" not in line:
+                                        line = f"socks5://{line}"
+                                    proxies.append(line)
+                            if proxies:
+                                return proxies
+                except Exception as e:
+                    logger.warning(f"Ошибка загрузки из {url}: {e}")
+        return []
+
+    async def get_proxy(self) -> Optional[str]:
+        async with self._lock:
+            if not self.proxies:
+                await self.load_proxies()
+            if not self.proxies:
+                return None
+            if self.current_index >= len(self.proxies):
+                self.current_index = 0
+            return self.proxies[self.current_index]
+
+    async def mark_failed(self, proxy: str) -> None:
+        async with self._lock:
+            if proxy in self.proxies:
+                self.proxies.remove(proxy)
+                logger.warning(f"Прокси {proxy} удалён")
+                with open(self.proxy_file, "w") as f:
+                    f.write("\n".join(self.proxies))
+            if self.current_index >= len(self.proxies):
+                self.current_index = 0
+
+    async def switch_to_next(self) -> Optional[str]:
+        async with self._lock:
+            if not self.proxies:
+                return None
+            self.current_index = (self.current_index + 1) % len(self.proxies)
+            return self.proxies[self.current_index]
 
 # ============================================================================
 #  БАЗА ДАННЫХ
@@ -115,8 +201,6 @@ async def init_db() -> None:
         await db.execute('CREATE INDEX IF NOT EXISTS idx_users_group ON users(group_name);')
         await db.commit()
     logger.info("База данных инициализирована")
-
-# ---- Функции БД ----
 
 async def get_user_group(user_id: int) -> Optional[str]:
     try:
@@ -376,23 +460,9 @@ async def fetch_schedule(group_name: str, week_number: int, session: aiohttp.Cli
             for day in schedule:
                 schedule[day].sort(key=lambda x: x["time"])
             return schedule
-    except (aiohttp.ClientError, asyncio.TimeoutError, ET.ParseError) as e:
+    except Exception as e:
         logger.error(f"Ошибка загрузки/парсинга {url}: {e}", exc_info=True)
         return None
-    except Exception as e:
-        logger.error(f"Неожиданная ошибка {url}: {e}", exc_info=True)
-        return None
-
-async def fetch_schedule_with_retry(group_name: str, week_number: int, session: aiohttp.ClientSession, retries: int = None) -> Optional[Dict[int, List[Dict[str, str]]]]:
-    if retries is None:
-        retries = settings.retry_count
-    for attempt in range(retries):
-        result = await fetch_schedule(group_name, week_number, session)
-        if result is not None:
-            return result
-        if attempt < retries - 1:
-            await asyncio.sleep(settings.retry_delay)
-    return None
 
 # ============================================================================
 #  УТИЛИТЫ
@@ -516,7 +586,7 @@ def validate_group_name(group_name: str) -> bool:
 
 _groups_cache_lock = asyncio.Lock()
 
-async def get_group_list(session: aiohttp.ClientSession, force_refresh: bool = False) -> List[str]:
+async def get_group_list(session: aiohttp.ClientSession, proxy_manager: ProxyManager, force_refresh: bool = False) -> List[str]:
     if os.path.exists(settings.groups_manual_file):
         try:
             async with aiofiles.open(settings.groups_manual_file, 'r') as f:
@@ -525,14 +595,12 @@ async def get_group_list(session: aiohttp.ClientSession, force_refresh: bool = F
                 if isinstance(manual, list) and manual:
                     valid_groups = [g for g in manual if validate_group_name(g)]
                     if valid_groups:
-                        logger.info("Группы из ручного файла (отфильтрованы)")
+                        logger.info("Группы из ручного файла")
                         return valid_groups
-                    else:
-                        logger.warning("Ручной файл групп не содержит валидных групп")
         except Exception as e:
             logger.warning(f"Ошибка ручного файла: {e}")
 
-    async with _groups_cache_lock:
+async with _groups_cache_lock:
         cache_file = settings.groups_cache_file
         if not force_refresh and os.path.exists(cache_file):
             try:
@@ -559,6 +627,11 @@ async def get_group_list(session: aiohttp.ClientSession, force_refresh: bool = F
                         return groups
         except Exception as e:
             logger.error(f"Ошибка загрузки групп: {e}", exc_info=True)
+            if proxy_manager:
+                current = await proxy_manager.get_proxy()
+                if current:
+                    await proxy_manager.mark_failed(current)
+                    logger.info("Прокси помечен как неработающий, пробуем следующий")
 
         if os.path.exists(cache_file):
             try:
@@ -620,12 +693,12 @@ async def refresh_cache_command(update: Update, context: ContextTypes.DEFAULT_TY
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
     logger.info("Ручное обновление кеша запущено")
-
-async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+ async def choose_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     session = context.bot_data.get('session')
-    groups = await get_group_list(session)
+    proxy_manager = context.bot_data.get('proxy_manager')
+    groups = await get_group_list(session, proxy_manager)
     if not groups:
         await query.edit_message_text("❌ Не удалось загрузить список групп. Попробуйте позже.")
         return
@@ -683,11 +756,12 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     session = context.bot_data.get('session')
-    all_groups = await get_group_list(session)
+    proxy_manager = context.bot_data.get('proxy_manager')
+    all_groups = await get_group_list(session, proxy_manager)
 
     if not all_groups:
         logger.warning("Список групп пуст, пробуем принудительно обновить...")
-        all_groups = await get_group_list(session, force_refresh=True)
+        all_groups = await get_group_list(session, proxy_manager, force_refresh=True)
         if not all_groups:
             keyboard = [[InlineKeyboardButton("📋 Выбрать группу", callback_data="choose_group")]]
             await query.edit_message_text(
@@ -710,7 +784,7 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     week = get_current_week()
-    schedule = await fetch_schedule_with_retry(group_name, week, session)
+    schedule = await fetch_schedule(group_name, week, session)
     if schedule is None:
         keyboard = [[InlineKeyboardButton("📋 Выбрать группу", callback_data="choose_group")]]
         await query.edit_message_text(
@@ -747,7 +821,7 @@ async def get_day_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE, d
     lessons = await get_cached_schedule(group, week, day)
     if not lessons:
         session = context.bot_data.get('session')
-        schedule = await fetch_schedule_with_retry(group, week, session)
+        schedule = await fetch_schedule(group, week, session)
         if schedule:
             await update_cache(group, week, schedule)
             lessons = schedule.get(day, [])
@@ -801,7 +875,7 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cached = await get_cached_schedule_partial(group, week)
     days_with_cache = set(cached.keys())
     if len(days_with_cache) < DAYS_IN_WEEK - 1:
-        full = await fetch_schedule_with_retry(group, week, session)
+        full = await fetch_schedule(group, week, session)
         if full:
             await update_cache(group, week, full)
             cached = await get_cached_schedule_partial(group, week)
@@ -811,7 +885,7 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         missing = [d for d in range(1, DAYS_IN_WEEK) if d not in days_with_cache]
         if missing:
-            full = await fetch_schedule_with_retry(group, week, session)
+            full = await fetch_schedule(group, week, session)
             if full:
                 await update_cache(group, week, full)
                 cached = await get_cached_schedule_partial(group, week)
@@ -901,6 +975,7 @@ async def refresh_all_caches(app: Application) -> None:
         weeks.add(w)
 
     session = app.bot_data.get('session')
+    proxy_manager = app.bot_data.get('proxy_manager')
     if session is None:
         logger.error("Нет сессии aiohttp в refresh_all_caches")
         return
@@ -910,11 +985,15 @@ async def refresh_all_caches(app: Application) -> None:
     async def fetch_group(group: str, week: int):
         async with semaphore:
             try:
-                sched = await fetch_schedule_with_retry(group, week, session)
+                sched = await fetch_schedule(group, week, session)
                 if sched:
                     await update_cache(group, week, sched)
                 else:
                     logger.warning(f"Не удалось загрузить {group} неделя {week}")
+                    if proxy_manager:
+                        current = await proxy_manager.get_proxy()
+                        if current:
+                            await proxy_manager.mark_failed(current)
             except Exception as e:
                 logger.error(f"Ошибка {group} неделя {week}: {e}", exc_info=True)
             finally:
@@ -947,6 +1026,7 @@ async def send_morning_schedule(app: Application) -> None:
     days = ["", "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
 
     session = app.bot_data.get('session')
+    proxy_manager = app.bot_data.get('proxy_manager')
     if session is None:
         logger.error("Нет сессии для рассылки")
         return
@@ -959,7 +1039,7 @@ async def send_morning_schedule(app: Application) -> None:
             try:
                 cached = await get_cached_schedule(group, week, day)
                 if not cached:
-                    sched = await fetch_schedule_with_retry(group, week, session)
+                    sched = await fetch_schedule(group, week, session)
                     if sched:
                         await update_cache(group, week, sched)
                 next_day = day + 1
@@ -967,11 +1047,15 @@ async def send_morning_schedule(app: Application) -> None:
                     next_week = week
                     cached_tomorrow = await get_cached_schedule(group, next_week, next_day)
                     if not cached_tomorrow:
-                        sched2 = await fetch_schedule_with_retry(group, next_week, session)
+                        sched2 = await fetch_schedule(group, next_week, session)
                         if sched2:
                             await update_cache(group, next_week, sched2)
             except Exception as e:
                 logger.error(f"Ошибка предзагрузки {group}: {e}", exc_info=True)
+                if proxy_manager:
+                    current = await proxy_manager.get_proxy()
+                    if current:
+                        await proxy_manager.mark_failed(current)
 
     await asyncio.gather(*(load_group(g) for g in groups_set), return_exceptions=True)
 
@@ -1084,7 +1168,7 @@ def run_flask():
         logger.error(f"Flask не запустился: {e}")
 
 # ============================================================================
-#  ЗАПУСК БОТА (исправленный)
+#  ЗАПУСК БОТА
 # ============================================================================
 
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
@@ -1111,30 +1195,43 @@ async def shutdown_app(app: Application) -> None:
     _background_tasks.clear()
     logger.info("Бот остановлен")
 
-def main():
+async def create_session_with_proxy(proxy_manager: ProxyManager) -> aiohttp.ClientSession:
+    proxy_url = await proxy_manager.get_proxy()
+    timeout = aiohttp.ClientTimeout(total=30)
+    if proxy_url:
+        try:
+            connector = aiohttp_socks.ProxyConnector.from_url(proxy_url)
+            session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+            logger.info(f"Используем прокси: {proxy_url}")
+            return session
+        except Exception as e:
+            logger.error(f"Ошибка подключения к прокси {proxy_url}: {e}")
+            await proxy_manager.mark_failed(proxy_url)
+            return await create_session_with_proxy(proxy_manager)
+    else:
+        logger.warning("Прокси не найдены, работаем напрямую")
+        return aiohttp.ClientSession(timeout=timeout)
+
+async def main_async() -> None:
     global _global_loop
+    _global_loop = asyncio.get_running_loop()
 
-    if not settings.bot_token:
-        logger.error("TELEGRAM_BOT_TOKEN не задан!")
-        sys.exit(1)
+    await init_db()
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    _global_loop = loop
+    proxy_manager = ProxyManager(settings.proxy_file)
+    await proxy_manager.load_proxies()
+    logger.info("Менеджер прокси инициализирован")
 
-    # Инициализация БД и создание сессии
-    async def init_and_session():
-        await init_db()
-        timeout = aiohttp.ClientTimeout(total=30)
-        session = aiohttp.ClientSession(timeout=timeout)
-        return session
+    session = await create_session_with_proxy(proxy_manager)
 
-    session = loop.run_until_complete(init_and_session())
-
-    app = Application.builder().token(settings.bot_token).build()
+    app = (Application.builder()
+           .token(settings.bot_token)
+           .connect_timeout(30)
+           .read_timeout(30)
+           .build())
     app.bot_data['session'] = session
+    app.bot_data['proxy_manager'] = proxy_manager
 
-    # Регистрация обработчиков
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("today", today))
@@ -1149,24 +1246,18 @@ def main():
     app.add_handler(CallbackQueryHandler(choose_group, pattern="^choose_group$|^page_\\d+$"))
     app.add_handler(CallbackQueryHandler(select_group, pattern="^group_"))
 
-    # Планировщик
-    async def start_scheduler():
-        scheduler.add_job(send_morning_schedule, CronTrigger(hour=settings.morning_send_hour, minute=settings.morning_send_minute, timezone=TZ), args=[app])
-        scheduler.add_job(refresh_all_caches, CronTrigger(hour=settings.cache_refresh_hour, minute=settings.cache_refresh_minute, timezone=TZ), args=[app])
-        scheduler.add_job(refresh_all_caches, CronTrigger(hour=settings.cache_refresh_extra_hour, minute=settings.cache_refresh_extra_minute, timezone=TZ), args=[app])
-        scheduler.add_job(clean_old_cache_job, CronTrigger(hour=settings.clean_cache_hour, minute=settings.clean_cache_minute, timezone=TZ))
-        scheduler.add_job(cleanup_cache_locks_job, CronTrigger(hour=settings.cleanup_locks_hour, minute=settings.cleanup_locks_minute, timezone=TZ))
-        scheduler.start()
-        logger.info("Планировщик запущен")
+    scheduler.add_job(send_morning_schedule, CronTrigger(hour=settings.morning_send_hour, minute=settings.morning_send_minute, timezone=TZ), args=[app])
+    scheduler.add_job(refresh_all_caches, CronTrigger(hour=settings.cache_refresh_hour, minute=settings.cache_refresh_minute, timezone=TZ), args=[app])
+    scheduler.add_job(refresh_all_caches, CronTrigger(hour=settings.cache_refresh_extra_hour, minute=settings.cache_refresh_extra_minute, timezone=TZ), args=[app])
+    scheduler.add_job(clean_old_cache_job, CronTrigger(hour=settings.clean_cache_hour, minute=settings.clean_cache_minute, timezone=TZ))
+    scheduler.add_job(cleanup_cache_locks_job, CronTrigger(hour=settings.cleanup_locks_hour, minute=settings.cleanup_locks_minute, timezone=TZ))
+    scheduler.start()
+    logger.info("Планировщик запущен")
 
-    loop.run_until_complete(start_scheduler())
-
-    # Flask
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info(f"Flask на порту {settings.port}")
 
-    # Обработка сигналов
     def signal_handler(sig, frame):
         logger.info("Получен сигнал")
         if _global_loop is not None and not _global_loop.is_closed():
@@ -1180,17 +1271,26 @@ def main():
         signal.signal(signal.SIGTERM, signal_handler)
 
     logger.info("✅ Бот запущен!")
-
     try:
-        # Запускаем polling синхронно (он сам создаст цикл)
-        app.run_polling(allowed_updates=["message", "callback_query"])
-    except KeyboardInterrupt:
-        pass
+        await app.run_polling(allowed_updates=["message", "callback_query"])
     except Exception as e:
         logger.error(f"Ошибка в run_polling: {e}", exc_info=True)
     finally:
-        loop.run_until_complete(shutdown_app(app))
+        await shutdown_app(app)
+
+def main():
+    if not settings.bot_token:
+        logger.error("TELEGRAM_BOT_TOKEN не задан!")
+        sys.exit(1)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(main_async())
+    except KeyboardInterrupt:
+        pass
+    finally:
         loop.close()
 
 if __name__ == "__main__":
-    main()
+    main()   
