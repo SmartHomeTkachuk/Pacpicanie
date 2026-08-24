@@ -3,7 +3,7 @@
 
 """
 Telegram-бот расписания Политеха.
-Версия 5.15 – исправлена ошибка no running event loop.
+Версия 5.16 – исправлен конфликт event loop.
 """
 
 import asyncio
@@ -1117,14 +1117,27 @@ async def shutdown_app(app: Application) -> None:
     _background_tasks.clear()
     logger.info("Бот остановлен")
 
-async def main_async() -> None:
+def main():
     global _global_loop
-    _global_loop = asyncio.get_running_loop()
 
-    await init_db()
+    if not settings.bot_token:
+        logger.error("TELEGRAM_BOT_TOKEN не задан!")
+        sys.exit(1)
 
-    timeout = aiohttp.ClientTimeout(total=30)
-    session = aiohttp.ClientSession(timeout=timeout)
+    # Создаём цикл событий
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _global_loop = loop
+
+    # Инициализация БД и создание сессии
+    async def init_and_session():
+        await init_db()
+        timeout = aiohttp.ClientTimeout(total=30)
+        session = aiohttp.ClientSession(timeout=timeout)
+        return session
+
+    session = loop.run_until_complete(init_and_session())
+
     app = Application.builder().token(settings.bot_token).build()
     app.bot_data['session'] = session
 
@@ -1157,40 +1170,32 @@ async def main_async() -> None:
     flask_thread.start()
     logger.info(f"Flask на порту {settings.port}")
 
-    # Сигналы
+    # Обработка сигналов
     def signal_handler(sig, frame):
         logger.info("Получен сигнал")
-        if _global_loop is not None and not _global_loop.is_closed():
-            asyncio.run_coroutine_threadsafe(shutdown_app(app), _global_loop)
+        if not loop.is_closed():
+            asyncio.run_coroutine_threadsafe(shutdown_app(app), loop)
 
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
-            _global_loop.add_signal_handler(sig, lambda: signal_handler(sig, None))
+            loop.add_signal_handler(sig, lambda: signal_handler(sig, None))
     except NotImplementedError:
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
     logger.info("✅ Бот запущен!")
+
+    # Запускаем polling, используя наш цикл
     try:
-        await app.run_polling(allowed_updates=["message", "callback_query"])
+        app.run_polling(allowed_updates=["message", "callback_query"], loop=loop)
+    except KeyboardInterrupt:
+        pass
     except Exception as e:
         logger.error(f"Ошибка в run_polling: {e}", exc_info=True)
     finally:
-        await shutdown_app(app)
-
-def main():
-    if not settings.bot_token:
-        logger.error("TELEGRAM_BOT_TOKEN не задан!")
-        sys.exit(1)
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(main_async())
-    except KeyboardInterrupt:
-        pass
-    finally:
+        loop.run_until_complete(shutdown_app(app))
         loop.close()
+        logger.info("Цикл событий закрыт")
 
 if __name__ == "__main__":
     main()
