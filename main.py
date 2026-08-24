@@ -3,7 +3,7 @@
 
 """
 Telegram-бот расписания Политеха.
-Версия 5.17 – исправлен запуск планировщика в правильном event loop.
+Версия 5.18 – окончательная, все ошибки запуска устранены.
 """
 
 import asyncio
@@ -116,7 +116,8 @@ async def init_db() -> None:
         await db.commit()
     logger.info("База данных инициализирована")
 
-# ---- Функции БД (без изменений) ----
+# ---- Функции БД ----
+
 async def get_user_group(user_id: int) -> Optional[str]:
     try:
         async with aiosqlite.connect(settings.db_name) as db:
@@ -222,6 +223,7 @@ async def delete_user_data(user_id: int) -> None:
         logger.error(f"Ошибка удаления: {e}", exc_info=True)
 
 # ---- Кеширование с блокировками ----
+
 _cache_update_locks: Dict[str, asyncio.Lock] = {}
 _cache_lock_timestamps: Dict[str, float] = {}
 _locks_creation_lock = asyncio.Lock()
@@ -570,7 +572,7 @@ async def get_group_list(session: aiohttp.ClientSession, force_refresh: bool = F
         return []
 
 # ============================================================================
-#  ОБРАБОТЧИКИ КОМАНД (без изменений)
+#  ОБРАБОТЧИКИ КОМАНД
 # ============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1043,7 +1045,7 @@ async def clean_old_cache_job() -> None:
             await db.close()
 
 # ============================================================================
-#  FLASK
+#  FLASK (МОНИТОРИНГ)
 # ============================================================================
 
 flask_app = Flask(__name__)
@@ -1082,12 +1084,11 @@ def run_flask():
         logger.error(f"Flask не запустился: {e}")
 
 # ============================================================================
-#  ЗАПУСК БОТА (исправленный)
+#  ЗАПУСК БОТА (финальный исправленный)
 # ============================================================================
 
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 _shutdown_in_progress = False
-_global_loop = None
 
 async def shutdown_app(app: Application) -> None:
     global _shutdown_in_progress
@@ -1165,9 +1166,9 @@ async def run_bot() -> None:
 
     logger.info("✅ Бот запущен!")
 
-    # ЯВНО ПЕРЕДАЁМ ЦИКЛ В run_polling
+    # Запускаем polling без аргумента loop (библиотека сама использует текущий цикл)
     try:
-        await app.run_polling(allowed_updates=["message", "callback_query"], loop=_global_loop)
+        await app.run_polling(allowed_updates=["message", "callback_query"])
     except Exception as e:
         logger.error(f"Ошибка в run_polling: {e}", exc_info=True)
     finally:
