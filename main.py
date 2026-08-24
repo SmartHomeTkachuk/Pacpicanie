@@ -3,7 +3,7 @@
 
 """
 Telegram-бот расписания Политеха.
-Версия 5.13 – исправлена ошибка запуска в Docker.
+Версия 5.14 – исправлена ошибка с event loop.
 """
 
 import asyncio
@@ -116,7 +116,7 @@ async def init_db() -> None:
         await db.commit()
     logger.info("База данных инициализирована")
 
-# ---- Функции БД (все асинхронные) ----
+# ---- Функции БД ----
 
 async def get_user_group(user_id: int) -> Optional[str]:
     try:
@@ -470,10 +470,8 @@ def split_long_text(text: str, max_len: int) -> List[str]:
                     if temp:
                         parts.append(temp)
                     if len(word) > max_len:
-                        # Разбиваем длинное слово на части, вставляя пробел между ними
                         for i in range(0, len(word), max_len):
-                            chunk = word[i:i+max_len]
-                            parts.append(chunk)
+                            parts.append(word[i:i+max_len])
                         temp = ""
                     else:
                         temp = word
@@ -519,7 +517,6 @@ def validate_group_name(group_name: str) -> bool:
 _groups_cache_lock = asyncio.Lock()
 
 async def get_group_list(session: aiohttp.ClientSession, force_refresh: bool = False) -> List[str]:
-    # Ручной файл с фильтрацией
     if os.path.exists(settings.groups_manual_file):
         try:
             async with aiofiles.open(settings.groups_manual_file, 'r') as f:
@@ -966,13 +963,11 @@ async def send_morning_schedule(app: Application) -> None:
     async def load_group(group: str):
         async with semaphore:
             try:
-                # Проверяем, есть ли кеш на сегодня
                 cached = await get_cached_schedule(group, week, day)
                 if not cached:
                     sched = await fetch_schedule_with_retry(group, week, session)
                     if sched:
                         await update_cache(group, week, sched)
-                # Завтра, если это не воскресенье и сегодня не суббота
                 next_day = day + 1
                 if next_day <= DAYS_IN_WEEK and day != 6:
                     next_week = week
@@ -1095,7 +1090,7 @@ def run_flask():
         logger.error(f"Flask не запустился: {e}")
 
 # ============================================================================
-#  ЗАПУСК БОТА (исправленная структура)
+#  ЗАПУСК БОТА (исправленная версия)
 # ============================================================================
 
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
@@ -1122,14 +1117,22 @@ async def shutdown_app(app: Application) -> None:
     _background_tasks.clear()
     logger.info("Бот остановлен")
 
-async def main_async() -> None:
+def main():
     global _global_loop
-    _global_loop = asyncio.get_running_loop()
 
-    await init_db()
+    if not settings.bot_token:
+        logger.error("TELEGRAM_BOT_TOKEN не задан!")
+        sys.exit(1)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _global_loop = loop
+
+    loop.run_until_complete(init_db())
 
     timeout = aiohttp.ClientTimeout(total=30)
     session = aiohttp.ClientSession(timeout=timeout)
+
     app = Application.builder().token(settings.bot_token).build()
     app.bot_data['session'] = session
 
@@ -1165,35 +1168,28 @@ async def main_async() -> None:
     # Сигналы
     def signal_handler(sig, frame):
         logger.info("Получен сигнал")
-        if _global_loop is not None and not _global_loop.is_closed():
-            asyncio.run_coroutine_threadsafe(shutdown_app(app), _global_loop)
+        if not loop.is_closed():
+            asyncio.run_coroutine_threadsafe(shutdown_app(app), loop)
 
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
-            _global_loop.add_signal_handler(sig, lambda: signal_handler(sig, None))
+            loop.add_signal_handler(sig, lambda: signal_handler(sig, None))
     except NotImplementedError:
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
     logger.info("✅ Бот запущен!")
-    try:
-        await app.run_polling(allowed_updates=["message", "callback_query"])
-    finally:
-        await shutdown_app(app)
 
-def main():
-    if not settings.bot_token:
-        logger.error("TELEGRAM_BOT_TOKEN не задан!")
-        sys.exit(1)
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(main_async())
-    except KeyboardInterrupt:
+        loop.run_until_complete(app.run_polling(allowed_updates=["message", "callback_query"]))
+    except (KeyboardInterrupt, SystemExit):
         pass
+    except Exception as e:
+        logger.error(f"Ошибка в run_polling: {e}", exc_info=True)
     finally:
+        loop.run_until_complete(shutdown_app(app))
         loop.close()
+        logger.info("Цикл событий закрыт")
 
 if __name__ == "__main__":
     main()
