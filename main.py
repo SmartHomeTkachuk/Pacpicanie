@@ -1082,11 +1082,12 @@ def run_flask():
         logger.error(f"Flask не запустился: {e}")
 
 # ============================================================================
-#  ЗАПУСК БОТА (исправленная структура)
+#  ЗАПУСК БОТА (исправленный)
 # ============================================================================
 
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
 _shutdown_in_progress = False
+_global_loop = None
 
 async def shutdown_app(app: Application) -> None:
     global _shutdown_in_progress
@@ -1135,7 +1136,7 @@ async def run_bot() -> None:
     app.add_handler(CallbackQueryHandler(choose_group, pattern="^choose_group$|^page_\\d+$"))
     app.add_handler(CallbackQueryHandler(select_group, pattern="^group_"))
 
-    # Добавление задач в планировщик
+    # Планировщик
     scheduler.add_job(send_morning_schedule, CronTrigger(hour=settings.morning_send_hour, minute=settings.morning_send_minute, timezone=TZ), args=[app])
     scheduler.add_job(refresh_all_caches, CronTrigger(hour=settings.cache_refresh_hour, minute=settings.cache_refresh_minute, timezone=TZ), args=[app])
     scheduler.add_job(refresh_all_caches, CronTrigger(hour=settings.cache_refresh_extra_hour, minute=settings.cache_refresh_extra_minute, timezone=TZ), args=[app])
@@ -1164,8 +1165,9 @@ async def run_bot() -> None:
 
     logger.info("✅ Бот запущен!")
 
+    # ЯВНО ПЕРЕДАЁМ ЦИКЛ В run_polling
     try:
-        await app.run_polling(allowed_updates=["message", "callback_query"])
+        await app.run_polling(allowed_updates=["message", "callback_query"], loop=_global_loop)
     except Exception as e:
         logger.error(f"Ошибка в run_polling: {e}", exc_info=True)
     finally:
