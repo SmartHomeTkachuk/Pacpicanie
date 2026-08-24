@@ -3,7 +3,7 @@
 
 """
 Telegram-бот расписания Политеха.
-Версия 5.18 – окончательная, все ошибки запуска устранены.
+Версия 5.19 – окончательная, исправлен запуск.
 """
 
 import asyncio
@@ -1084,7 +1084,7 @@ def run_flask():
         logger.error(f"Flask не запустился: {e}")
 
 # ============================================================================
-#  ЗАПУСК БОТА (финальный исправленный)
+#  ЗАПУСК БОТА (исправленный)
 # ============================================================================
 
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
@@ -1111,14 +1111,26 @@ async def shutdown_app(app: Application) -> None:
     _background_tasks.clear()
     logger.info("Бот остановлен")
 
-async def run_bot() -> None:
+def main():
     global _global_loop
-    _global_loop = asyncio.get_running_loop()
 
-    await init_db()
+    if not settings.bot_token:
+        logger.error("TELEGRAM_BOT_TOKEN не задан!")
+        sys.exit(1)
 
-    timeout = aiohttp.ClientTimeout(total=30)
-    session = aiohttp.ClientSession(timeout=timeout)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _global_loop = loop
+
+    # Инициализация БД и создание сессии
+    async def init_and_session():
+        await init_db()
+        timeout = aiohttp.ClientTimeout(total=30)
+        session = aiohttp.ClientSession(timeout=timeout)
+        return session
+
+    session = loop.run_until_complete(init_and_session())
+
     app = Application.builder().token(settings.bot_token).build()
     app.bot_data['session'] = session
 
@@ -1138,13 +1150,16 @@ async def run_bot() -> None:
     app.add_handler(CallbackQueryHandler(select_group, pattern="^group_"))
 
     # Планировщик
-    scheduler.add_job(send_morning_schedule, CronTrigger(hour=settings.morning_send_hour, minute=settings.morning_send_minute, timezone=TZ), args=[app])
-    scheduler.add_job(refresh_all_caches, CronTrigger(hour=settings.cache_refresh_hour, minute=settings.cache_refresh_minute, timezone=TZ), args=[app])
-    scheduler.add_job(refresh_all_caches, CronTrigger(hour=settings.cache_refresh_extra_hour, minute=settings.cache_refresh_extra_minute, timezone=TZ), args=[app])
-    scheduler.add_job(clean_old_cache_job, CronTrigger(hour=settings.clean_cache_hour, minute=settings.clean_cache_minute, timezone=TZ))
-    scheduler.add_job(cleanup_cache_locks_job, CronTrigger(hour=settings.cleanup_locks_hour, minute=settings.cleanup_locks_minute, timezone=TZ))
-    scheduler.start()
-    logger.info("Планировщик запущен")
+    async def start_scheduler():
+        scheduler.add_job(send_morning_schedule, CronTrigger(hour=settings.morning_send_hour, minute=settings.morning_send_minute, timezone=TZ), args=[app])
+        scheduler.add_job(refresh_all_caches, CronTrigger(hour=settings.cache_refresh_hour, minute=settings.cache_refresh_minute, timezone=TZ), args=[app])
+        scheduler.add_job(refresh_all_caches, CronTrigger(hour=settings.cache_refresh_extra_hour, minute=settings.cache_refresh_extra_minute, timezone=TZ), args=[app])
+        scheduler.add_job(clean_old_cache_job, CronTrigger(hour=settings.clean_cache_hour, minute=settings.clean_cache_minute, timezone=TZ))
+        scheduler.add_job(cleanup_cache_locks_job, CronTrigger(hour=settings.cleanup_locks_hour, minute=settings.cleanup_locks_minute, timezone=TZ))
+        scheduler.start()
+        logger.info("Планировщик запущен")
+
+    loop.run_until_complete(start_scheduler())
 
     # Flask
     flask_thread = Thread(target=run_flask, daemon=True)
@@ -1166,26 +1181,15 @@ async def run_bot() -> None:
 
     logger.info("✅ Бот запущен!")
 
-    # Запускаем polling без аргумента loop (библиотека сама использует текущий цикл)
     try:
-        await app.run_polling(allowed_updates=["message", "callback_query"])
+        # Запускаем polling синхронно (он сам создаст цикл)
+        app.run_polling(allowed_updates=["message", "callback_query"])
+    except KeyboardInterrupt:
+        pass
     except Exception as e:
         logger.error(f"Ошибка в run_polling: {e}", exc_info=True)
     finally:
-        await shutdown_app(app)
-
-def main():
-    if not settings.bot_token:
-        logger.error("TELEGRAM_BOT_TOKEN не задан!")
-        sys.exit(1)
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(run_bot())
-    except KeyboardInterrupt:
-        pass
-    finally:
+        loop.run_until_complete(shutdown_app(app))
         loop.close()
 
 if __name__ == "__main__":
