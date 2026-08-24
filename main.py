@@ -3,7 +3,7 @@
 
 """
 Telegram-бот расписания Политеха.
-Версия 5.16 – исправлен конфликт event loop.
+Версия 5.17 – исправлен запуск планировщика в правильном event loop.
 """
 
 import asyncio
@@ -116,8 +116,7 @@ async def init_db() -> None:
         await db.commit()
     logger.info("База данных инициализирована")
 
-# ---- Функции БД ----
-
+# ---- Функции БД (без изменений) ----
 async def get_user_group(user_id: int) -> Optional[str]:
     try:
         async with aiosqlite.connect(settings.db_name) as db:
@@ -223,7 +222,6 @@ async def delete_user_data(user_id: int) -> None:
         logger.error(f"Ошибка удаления: {e}", exc_info=True)
 
 # ---- Кеширование с блокировками ----
-
 _cache_update_locks: Dict[str, asyncio.Lock] = {}
 _cache_lock_timestamps: Dict[str, float] = {}
 _locks_creation_lock = asyncio.Lock()
@@ -572,7 +570,7 @@ async def get_group_list(session: aiohttp.ClientSession, force_refresh: bool = F
         return []
 
 # ============================================================================
-#  ОБРАБОТЧИКИ КОМАНД
+#  ОБРАБОТЧИКИ КОМАНД (без изменений)
 # ============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -723,8 +721,6 @@ async def select_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update_cache(group_name, week, schedule)
     await query.edit_message_text(f"✅ Группа {group_name} сохранена!\nИспользуй /help.")
 
-# ---- Общая функция для today/tomorrow ----
-
 async def get_day_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE, delta_days: int) -> None:
     user_id = update.effective_user.id
     group = await get_user_group(user_id)
@@ -778,8 +774,6 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await get_day_schedule(update, context, 1)
-
-# ---- Команда /week ----
 
 async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -856,8 +850,6 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 break
             else:
                 logger.error(f"Ошибка отправки {user_id}: {e}")
-
-# ---- Остальные команды ----
 
 async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -1051,7 +1043,7 @@ async def clean_old_cache_job() -> None:
             await db.close()
 
 # ============================================================================
-#  FLASK (МОНИТОРИНГ)
+#  FLASK
 # ============================================================================
 
 flask_app = Flask(__name__)
@@ -1090,7 +1082,7 @@ def run_flask():
         logger.error(f"Flask не запустился: {e}")
 
 # ============================================================================
-#  ЗАПУСК БОТА (исправленный)
+#  ЗАПУСК БОТА (исправленная структура)
 # ============================================================================
 
 scheduler = AsyncIOScheduler(timezone=settings.timezone)
@@ -1117,27 +1109,14 @@ async def shutdown_app(app: Application) -> None:
     _background_tasks.clear()
     logger.info("Бот остановлен")
 
-def main():
+async def run_bot() -> None:
     global _global_loop
+    _global_loop = asyncio.get_running_loop()
 
-    if not settings.bot_token:
-        logger.error("TELEGRAM_BOT_TOKEN не задан!")
-        sys.exit(1)
+    await init_db()
 
-    # Создаём цикл событий
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    _global_loop = loop
-
-    # Инициализация БД и создание сессии
-    async def init_and_session():
-        await init_db()
-        timeout = aiohttp.ClientTimeout(total=30)
-        session = aiohttp.ClientSession(timeout=timeout)
-        return session
-
-    session = loop.run_until_complete(init_and_session())
-
+    timeout = aiohttp.ClientTimeout(total=30)
+    session = aiohttp.ClientSession(timeout=timeout)
     app = Application.builder().token(settings.bot_token).build()
     app.bot_data['session'] = session
 
@@ -1156,7 +1135,7 @@ def main():
     app.add_handler(CallbackQueryHandler(choose_group, pattern="^choose_group$|^page_\\d+$"))
     app.add_handler(CallbackQueryHandler(select_group, pattern="^group_"))
 
-    # Планировщик
+    # Добавление задач в планировщик
     scheduler.add_job(send_morning_schedule, CronTrigger(hour=settings.morning_send_hour, minute=settings.morning_send_minute, timezone=TZ), args=[app])
     scheduler.add_job(refresh_all_caches, CronTrigger(hour=settings.cache_refresh_hour, minute=settings.cache_refresh_minute, timezone=TZ), args=[app])
     scheduler.add_job(refresh_all_caches, CronTrigger(hour=settings.cache_refresh_extra_hour, minute=settings.cache_refresh_extra_minute, timezone=TZ), args=[app])
@@ -1173,29 +1152,38 @@ def main():
     # Обработка сигналов
     def signal_handler(sig, frame):
         logger.info("Получен сигнал")
-        if not loop.is_closed():
-            asyncio.run_coroutine_threadsafe(shutdown_app(app), loop)
+        if _global_loop is not None and not _global_loop.is_closed():
+            asyncio.run_coroutine_threadsafe(shutdown_app(app), _global_loop)
 
     try:
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: signal_handler(sig, None))
+            _global_loop.add_signal_handler(sig, lambda: signal_handler(sig, None))
     except NotImplementedError:
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
     logger.info("✅ Бот запущен!")
 
-    # Запускаем polling, используя наш цикл
     try:
-        app.run_polling(allowed_updates=["message", "callback_query"], loop=loop)
-    except KeyboardInterrupt:
-        pass
+        await app.run_polling(allowed_updates=["message", "callback_query"])
     except Exception as e:
         logger.error(f"Ошибка в run_polling: {e}", exc_info=True)
     finally:
-        loop.run_until_complete(shutdown_app(app))
+        await shutdown_app(app)
+
+def main():
+    if not settings.bot_token:
+        logger.error("TELEGRAM_BOT_TOKEN не задан!")
+        sys.exit(1)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(run_bot())
+    except KeyboardInterrupt:
+        pass
+    finally:
         loop.close()
-        logger.info("Цикл событий закрыт")
 
 if __name__ == "__main__":
     main()
